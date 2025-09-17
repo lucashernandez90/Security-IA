@@ -2,26 +2,32 @@ version: "3.8"
 
 services:
   zookeeper:
-    image: wurstmeister/zookeeper:3.4.6
+    image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
-    restart: always
     ports:
       - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
     networks:
       - kafka-net
     volumes:
-      - zookeeper_data:/data
+      - zookeeper_data:/var/lib/zookeeper
 
   kafka:
-    image: wurstmeister/kafka:2.12-2.3.1
+    image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
-    restart: always
     ports:
       - "9092:9092"
+      - "9093:9093"
+      - "29092:29092"
     environment:
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093,PLAINTEXT_DOCKER://kafka:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9093,PLAINTEXT_DOCKER://0.0.0.0:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,PLAINTEXT_DOCKER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     depends_on:
@@ -29,12 +35,13 @@ services:
     networks:
       - kafka-net
     volumes:
-      - kafka_data:/kafka
+      - kafka_data:/var/lib/kafka
 
+  # FLINK (opcional - só se for usar Flink no Docker)
   jobmanager:
     image: flink:1.17.1-scala_2.12
     container_name: flink-jobmanager
-    restart: always
+    restart: unless-stopped
     ports:
       - "8081:8081"
     command: jobmanager
@@ -48,7 +55,7 @@ services:
   taskmanager:
     image: flink:1.17.1-scala_2.12
     container_name: flink-taskmanager
-    restart: always
+    restart: unless-stopped
     command: taskmanager
     environment:
       - JOB_MANAGER_RPC_ADDRESS=jobmanager
@@ -57,28 +64,27 @@ services:
     networks:
       - kafka-net
 
-  # Container Python 3.11 para treinamento
-  python-train:
+  # PRÉ-PROCESSAMENTO
+  python-preprocess:
     image: python:3.11-slim
-    container_name: python-train
-    restart: unless-stopped
+    container_name: python-preprocess
+    restart: on-failure
     working_dir: /app
     volumes:
-      - ./:/app  # Monta o código atual
+      - ./:/app  
     networks:
       - kafka-net
     environment:
       - PYTHONPATH=/app
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     command: >
       sh -c "pip install -r requirements.txt &&
-             python src/train.py --in-dir data/processed --out-models models --out-reports reports --task binary"
+             python src/preprocessing.py --raw-dir data/raw/MachineLearningCVE --out-dir data/processed --task multiclass --scaler standard"
 
-  # Container Python 3.11 para preprocessing
-  python-preprocess:
+  # TREINAMENTO 
+  python-train:
     image: python:3.11-slim
-    container_name: python-preprocess
-    restart: unless-stopped
+    container_name: python-train
+    restart: on-failure
     working_dir: /app
     volumes:
       - ./:/app
@@ -86,11 +92,14 @@ services:
       - kafka-net
     environment:
       - PYTHONPATH=/app
+    depends_on:
+      - python-preprocess
     command: >
-      sh -c "pip install -r requirements.txt &&
-             python src/preprocessing.py --raw-dir data/raw --out-dir data/processed --task binary --scaler minmax"
+      sh -c "apt-get update && apt-get install -y libgomp1 cmake build-essential &&
+             pip install -r requirements.txt &&
+             python src/train.py --in-dir data/processed --out-models models --out-reports reports --task multiclass --cv-folds 3"
 
-  #Container Python 3.11 para producer 
+  # PRODUCER 
   python-producer:
     image: python:3.11-slim
     container_name: python-producer
@@ -102,12 +111,39 @@ services:
       - kafka-net
     environment:
       - PYTHONPATH=/app
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092  # ✅ Correto dentro do Docker
+    depends_on:
+      - python-train
+      - kafka
     command: >
-      sh -c "pip install -r requirements.txt &&
-             python src/producer.py"
+      sh -c "apt-get update && apt-get install -y libgomp1 &&
+             pip install -r requirements.txt &&
+             python src/producer.py --bootstrap-servers kafka:9092 --num-messages 1000 --delay 0.01"
 
-  # Container Python 3.11 para desenvolvimento
+  # FLINK JOB 
+  python-flink-job:
+    image: python:3.11-slim
+    container_name: python-flink-job
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./:/app
+    networks:
+      - kafka-net
+    environment:
+      - PYTHONPATH=/app
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    depends_on:
+      - python-train
+      - kafka
+      - jobmanager
+      - taskmanager
+    command: >
+      sh -c "apt-get update && apt-get install -y libgomp1 openjdk-11-jre &&
+             pip install -r requirements.txt apache-flink==1.17.1 &&
+             python src/flink_job.py"
+
+  # CONTAINER DE DESENVOLVIMENTO
   python-dev:
     image: python:3.11-slim
     container_name: python-dev
@@ -122,10 +158,19 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     stdin_open: true
     tty: true
-    command: tail -f /dev/null  # Mantém o container rodando
+    depends_on:
+      - kafka
+    command: >
+      sh -c "apt-get update && apt-get install -y libgomp1 cmake build-essential netcat-openbsd &&
+             pip install -r requirements.txt &&
+             echo 'Aguardando Kafka...' &&
+             while ! nc -z kafka 9092; do sleep 1; done &&
+             echo 'Kafka pronto!' &&
+             tail -f /dev/null"
 
 networks:
   kafka-net:
+    driver: bridge
 
 volumes:
   zookeeper_data:

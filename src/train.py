@@ -1,7 +1,7 @@
 """
 train.py – Treina XGBoost e LightGBM usando os .npy de data/processed.
 Exemplo:
-    python src/train.py --in-dir data/processed --out-models models --out-reports reports --task binary
+    python src/train.py --in-dir data/processed --out-models models --out-reports reports --task multiclass
 """
 from __future__ import annotations
 import argparse
@@ -20,12 +20,32 @@ logger = logging.getLogger(__name__)
 def load_processed(in_dir: str):
     """Carrega dados pré-processados + metadados"""
     try:
-        X_train = np.load(os.path.join(in_dir, "X_train.npy"))
-        X_test = np.load(os.path.join(in_dir, "X_test.npy"))
-        y_train = np.load(os.path.join(in_dir, "y_train.npy"))
+        # Carregar dados com nomes corretos
+        X_train = np.load(os.path.join(in_dir, "X_train_balanced.npy"))
+        X_test = np.load(os.path.join(in_dir, "X_test_scaled.npy"))
+        y_train = np.load(os.path.join(in_dir, "y_train_balanced.npy"))
         y_test = np.load(os.path.join(in_dir, "y_test.npy"))
-        meta = json.load(open(os.path.join(in_dir, "metadata.json"), encoding="utf-8"))
+        
+        # Criar metadata manualmente se não existir
+        metadata_path = os.path.join(in_dir, "metadata.json")
+        if os.path.exists(metadata_path):
+            meta = json.load(open(metadata_path, encoding="utf-8"))
+        else:
+            # Criar metadata automaticamente
+            unique_classes = np.unique(np.concatenate([y_train, y_test]))
+            meta = {
+                "class_names": [f"Class_{i}" for i in range(len(unique_classes))],
+                "n_classes": len(unique_classes),
+                "input_shape": X_train.shape[1:]
+            }
+            # Salvar metadata
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(meta, f, indent=2)
+            logger.info(f"Metadata criado automaticamente: {meta}")
+        
         logger.info(f"Dados carregados: X_train={X_train.shape}, X_test={X_test.shape}")
+        logger.info(f"Distribuição treino: {np.bincount(y_train)}")
+        logger.info(f"Distribuição teste: {np.bincount(y_test)}")
         return X_train, X_test, y_train, y_test, meta
     except Exception as e:
         logger.error(f"Erro ao carregar dados processados: {e}")
@@ -36,7 +56,7 @@ def train_xgboost(X_train, y_train, task: str):
     try:
         from xgboost import XGBClassifier
         params = dict(
-            n_estimators=300,
+            n_estimators=200,  # Reduzido para ser mais rápido
             learning_rate=0.1,
             max_depth=6,
             subsample=0.8,
@@ -46,14 +66,19 @@ def train_xgboost(X_train, y_train, task: str):
             random_state=42,
             n_jobs=-1,
             tree_method="hist",
-            eval_metric="logloss",
+            eval_metric="mlogloss" if task == "multiclass" else "logloss",
             verbosity=0
         )
+        
         if task == "binary":
             pos, neg = (y_train == 1).sum(), (y_train == 0).sum()
             if pos > 0:
                 params["scale_pos_weight"] = neg / pos
                 logger.info(f"Scale pos weight calculado: {params['scale_pos_weight']:.2f}")
+        else:
+            # Para multiclass
+            params["objective"] = "multi:softprob"
+            params["num_class"] = len(np.unique(y_train))
 
         model = XGBClassifier(**params)
         model.fit(X_train, y_train)
@@ -68,10 +93,10 @@ def train_lightgbm(X_train, y_train, task: str):
     try:
         from lightgbm import LGBMClassifier
         params = dict(
-            n_estimators=400,
+            n_estimators=200,  # Reduzido para ser mais rápido
             learning_rate=0.05,
             max_depth=-1,
-            num_leaves=64,
+            num_leaves=31,  # Reduzido para evitar overfitting
             subsample=0.8,
             colsample_bytree=0.8,
             reg_alpha=0.0,
@@ -80,6 +105,7 @@ def train_lightgbm(X_train, y_train, task: str):
             n_jobs=-1,
             verbose=-1
         )
+        
         if task == "binary":
             params["objective"] = "binary"
             params["is_unbalance"] = True
@@ -95,7 +121,7 @@ def train_lightgbm(X_train, y_train, task: str):
         logger.error(f"Erro no treinamento LightGBM: {e}")
         raise
 
-def kfold_cv(model_ctor, X, y, task: str, n_splits: int = 5):
+def kfold_cv(model_ctor, X, y, task: str, n_splits: int = 3):  # Reduzido para 3 folds
     """Executa validação cruzada estratificada e retorna métricas médias"""
     try:
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -104,7 +130,17 @@ def kfold_cv(model_ctor, X, y, task: str, n_splits: int = 5):
         logger.info(f"Iniciando {n_splits}-fold cross validation...")
         for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
             logger.info(f"Processando fold {fold + 1}/{n_splits}")
-            m, _ = model_ctor(X[train_idx], y[train_idx], task)
+            X_fold_train, y_fold_train = X[train_idx], y[train_idx]
+            
+            # Amostrar para tornar mais rápido
+            from sklearn.utils import resample
+            if len(X_fold_train) > 50000:
+                X_fold_train, y_fold_train = resample(
+                    X_fold_train, y_fold_train, 
+                    n_samples=50000, random_state=42, stratify=y_fold_train
+                )
+            
+            m, _ = model_ctor(X_fold_train, y_fold_train, task)
             y_pred = m.predict(X[val_idx])
             avg = "binary" if task == "binary" else "macro"
             s = compute_metrics(y[val_idx], y_pred, average=avg)
@@ -178,8 +214,8 @@ def main():
     ap.add_argument("--in-dir", default="data/processed", help="Diretório com dados processados")
     ap.add_argument("--out-models", default="models", help="Diretório de saída para modelos")
     ap.add_argument("--out-reports", default="reports", help="Diretório de saída para relatórios")
-    ap.add_argument("--task", choices=["binary", "multiclass"], default="binary", help="Tipo de tarefa de classificação")
-    ap.add_argument("--cv-folds", type=int, default=5, help="Número de folds para cross-validation")
+    ap.add_argument("--task", choices=["binary", "multiclass"], default="multiclass", help="Tipo de tarefa de classificação")
+    ap.add_argument("--cv-folds", type=int, default=3, help="Número de folds para cross-validation")  # Reduzido
     args = ap.parse_args()
 
     try:
@@ -193,7 +229,17 @@ def main():
         labels = meta["class_names"]
         avg = "binary" if args.task == "binary" else "macro"
 
-        logger.info(f"Distribuição das classes - Treino: {np.bincount(y_train)}, Teste: {np.bincount(y_test)}")
+        logger.info(f"Número de classes: {len(labels)}")
+        logger.info(f"Labels: {labels}")
+
+        # Reduzir tamanho do treino se for muito grande
+        if len(X_train) > 100000:
+            from sklearn.utils import resample
+            X_train, y_train = resample(
+                X_train, y_train, 
+                n_samples=100000, random_state=42, stratify=y_train
+            )
+            logger.info(f"Dataset reduzido para: {X_train.shape[0]:,} amostras")
 
         # XGBoost
         logger.info("=" * 50)

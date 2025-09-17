@@ -2,7 +2,7 @@
 preprocessing.py – Consolida CSVs do CICIDS2017, limpa, normaliza e salva .npy.
 Exemplo de uso:
 
-python src/preprocessing.py --raw-dir data/raw/MachineLearningCVE --out-dir data/processed --task binary --scaler minmax
+python src/preprocessing.py --raw-dir data/raw/MachineLearningCVE --out-dir data/processed --task multiclass --scaler standard
 
 """
 from __future__ import annotations
@@ -27,14 +27,36 @@ logger = logging.getLogger(__name__)
 
 COLUMNS_TO_DROP = [
     "Flow ID", "FlowID",
-    "Src IP", "Source IP",
+    "Src IP", "Source IP", 
     "Dst IP", "Destination IP",
     "Src Port", "Source Port",
     "Dst Port", "Destination Port",
     "Timestamp", "Timestamp ",
     "Fwd Header Length",  
-    "Bwd Header Length"   
+    "Bwd Header Length",
+    "Fwd Header Length.1"
 ]
+
+def agrupar_classes(label_series: pd.Series) -> pd.Series:
+    """Agrupa classes raras em categorias"""
+    def agrupar(label):
+        label_str = str(label).strip().upper()
+        if 'WEB ATTACK' in label_str:
+            return 'Web Attack'
+        elif 'DOS' in label_str and 'HULK' not in label_str and 'GOLDENEYE' not in label_str:
+            return 'DoS Other'
+        elif 'PATATOR' in label_str:
+            return 'Patator'
+        elif label_str in ['HEARTBLEED', 'INFILTRATION']:
+            return 'Other Rare Attack'
+        elif label_str == 'BENIGN':
+            return 'BENIGN'
+        elif label_str in ['BOT', 'DDOS', 'DOS HULK', 'DOS GOLDENEYE']:
+            return label_str
+        else:
+            return 'Other Rare Attack'
+    
+    return label_series.apply(agrupar)
 
 def read_all_csvs(raw_dir: str) -> pd.DataFrame:
     """Lê e concatena todos os CSVs do diretório"""
@@ -57,7 +79,7 @@ def read_all_csvs(raw_dir: str) -> pd.DataFrame:
         raise RuntimeError("Nenhum CSV foi lido com sucesso")
     
     result = pd.concat(dfs, ignore_index=True)
-    logger.info(f"Total de dados concatenados: {result.shape[0]} linhas, {result.shape[1]} colunas")
+    logger.info(f"Total de dados concatenados: {result.shape[0]} linha, {result.shape[1]} colunas")
     return result
 
 def validate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -102,7 +124,7 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
 
 def map_labels(series: pd.Series, task: str) -> (pd.Series, List[str]):
     """
-    task='binary' → 0=Benign, 1=Attack
+    task='binary' → 0=Benign, 1=Attack  
     task='multiclass' → classes originais
     """
     clean = series.astype(str).str.strip().str.upper()
@@ -155,8 +177,8 @@ def main():
     ap = argparse.ArgumentParser(description="Pré-processamento de dados do CICIDS2017")
     ap.add_argument("--raw-dir", required=True, help="Diretório com CSVs do CICIDS2017")
     ap.add_argument("--out-dir", default="data/processed", help="Saída (.npy, scaler, metadados)")
-    ap.add_argument("--task", choices=["binary", "multiclass"], default="binary", help="Tipo de tarefa")
-    ap.add_argument("--scaler", choices=["minmax", "standard"], default="minmax", help="Tipo de scaler")
+    ap.add_argument("--task", choices=["binary", "multiclass"], default="multiclass", help="Tipo de tarefa")
+    ap.add_argument("--scaler", choices=["minmax", "standard"], default="standard", help="Tipo de scaler")
     ap.add_argument("--test-size", type=float, default=0.2, help="Tamanho do conjunto de teste")
     ap.add_argument("--random-state", type=int, default=42, help="Seed para reproducibilidade")
     ap.add_argument("--min-samples", type=int, default=100, help="Mínimo de amostras por classe")
@@ -202,7 +224,13 @@ def main():
         y_raw = df[label_col]
         X = df.drop(columns=[label_col])
 
-        # Converte tudo numérico (coerção segura)
+        # 6.5) Aplicar agrupamento de classes para multiclass
+        if args.task == "multiclass":
+            logger.info("Agrupando classes raras...")
+            y_raw = agrupar_classes(y_raw)
+            logger.info(f"Distribuição após agrupamento: {y_raw.value_counts().to_dict()}")
+
+        # 7) Converte tudo numérico (coerção segura)
         logger.info("Convertendo features para numérico...")
         X = X.apply(pd.to_numeric, errors="coerce")
         
@@ -212,18 +240,6 @@ def main():
             logger.warning(f"Removendo {non_numeric_mask.sum()} linhas com valores não numéricos")
             X = X[~non_numeric_mask]
             y_raw = y_raw[~non_numeric_mask]
-
-        # 7) Filtra classes com poucas amostras
-        if args.task == "multiclass":
-            value_counts = y_raw.value_counts()
-            valid_classes = value_counts[value_counts >= args.min_samples].index
-            mask = y_raw.isin(valid_classes)
-            
-            removed_classes = set(y_raw.unique()) - set(valid_classes)
-            if removed_classes:
-                logger.warning(f"Removendo classes com menos de {args.min_samples} amostras: {removed_classes}")
-                X = X[mask]
-                y_raw = y_raw[mask]
 
         # 8) Codifica rótulos
         logger.info("Codificando labels...")
@@ -248,9 +264,9 @@ def main():
 
         # 11) Salva artefatos
         logger.info("Salvando artefatos...")
-        np.save(os.path.join(args.out_dir, "X_train.npy"), X_train_scaled)
-        np.save(os.path.join(args.out_dir, "X_test.npy"), X_test_scaled)
-        np.save(os.path.join(args.out_dir, "y_train.npy"), y_train)
+        np.save(os.path.join(args.out_dir, "X_train_balanced.npy"), X_train_scaled)
+        np.save(os.path.join(args.out_dir, "X_test_scaled.npy"), X_test_scaled)
+        np.save(os.path.join(args.out_dir, "y_train_balanced.npy"), y_train)
         np.save(os.path.join(args.out_dir, "y_test.npy"), y_test)
 
         joblib.dump(scaler, os.path.join(args.out_dir, "scaler.pkl"))
@@ -273,24 +289,6 @@ def main():
         
         save_json(meta, os.path.join(args.out_dir, "metadata.json"))
         
-        #Salvar estatísticas descritivas
-        stats = {
-            "X_train_stats": {
-                "mean": float(X_train_scaled.mean()),
-                "std": float(X_train_scaled.std()),
-                "min": float(X_train_scaled.min()),
-                "max": float(X_train_scaled.max())
-            },
-            "feature_ranges": {
-                col: {
-                    "min": float(X[col].min()),
-                    "max": float(X[col].max()),
-                    "mean": float(X[col].mean())
-                } for col in X.columns[:10]  
-            }
-        }
-        save_json(stats, os.path.join(args.out_dir, "statistics.json"))
-
         logger.info(f"[OK] Processamento concluído. Artefatos em: {args.out_dir}")
         logger.info(f"Distribuição final - Treino: {np.bincount(y_train)}, Teste: {np.bincount(y_test)}")
 
